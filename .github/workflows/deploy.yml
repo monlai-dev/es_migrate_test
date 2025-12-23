@@ -7,6 +7,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -14,7 +15,7 @@ jobs:
       # 1. Build the modified image with GCS Plugin
       - name: Build Docker Image
         run: |
-          cat <<EOF > Dockerfile
+          cat << 'EOF' > Dockerfile
           FROM docker.elastic.co/elasticsearch/elasticsearch:6.8.23
           RUN bin/elasticsearch-plugin install --batch repository-gcs
           EOF
@@ -39,14 +40,16 @@ jobs:
           script: |
             # Set the Host Virtual Memory (Required for ES)
             sudo sysctl -w vm.max_map_count=262144
-
+            
             # Save GCS Key from secret to a temp file
-            echo '${{ secrets.GCS_SERVICE_ACCOUNT_JSON }}' > /tmp/gcs-key.json
-
+            cat << 'GCSKEYEOF' > /tmp/gcs-key.json
+            ${{ secrets.GCS_SERVICE_ACCOUNT_JSON }}
+            GCSKEYEOF
+            
             # Stop and Clean old containers
             docker stop es-node || true
             docker rm es-node || true
-
+            
             # Start container with strict Memory Limits for 1GB RAM VM
             # Removed Kibana port 5601
             docker run -d --name es-node \
@@ -55,11 +58,13 @@ jobs:
               -e "ES_JAVA_OPTS=-Xms256m -Xmx256m" \
               -v es_data:/usr/share/elasticsearch/data \
               ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
-
+            
             # Wait for ES to be ready
             echo "Waiting for ES startup..."
-            until curl -s localhost:9200; do sleep 5; done
-
+            until curl -s localhost:9200 > /dev/null; do 
+              sleep 5
+            done
+            
             # 3. Inject Credentials into Keystore
             docker cp /tmp/gcs-key.json es-node:/usr/share/elasticsearch/config/gcs-key.json
             docker exec es-node bin/elasticsearch-keystore add-file gcs.client.default.credentials_file config/gcs-key.json
@@ -67,23 +72,26 @@ jobs:
             # Restart ES (Required in v6.8 for Keystore files to be recognized properly)
             docker restart es-node
             echo "Waiting for ES to restart after keystore update..."
-            until curl -s localhost:9200; do sleep 5; done
-
+            until curl -s localhost:9200 > /dev/null; do 
+              sleep 5
+            done
+            
             # 4. VERIFY: Check if GCS plugin is loaded via API
             echo "Verifying GCS Plugin status..."
-            curl -s "localhost:9200/_cat/plugins?v" | grep repository-gcs || (echo "Plugin not found!" && exit 1)
-
+            if ! curl -s "localhost:9200/_cat/plugins?v" | grep -q repository-gcs; then
+              echo "Plugin not found!"
+              exit 1
+            fi
+            
             # 5. START FLOW: Register GCS Repository
-            # Replace 'your-gcs-bucket-name' with your actual bucket secret if available
-            curl -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'
-            {
+            curl -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'{
               "type": "gcs",
               "settings": {
                 "bucket": "${{ secrets.GCS_BUCKET_NAME }}",
                 "base_path": "backups/v68"
               }
             }'
-
+            
             # 6. TRIGGER SNAPSHOT
             echo "Starting Snapshot..."
             curl -X PUT "localhost:9200/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false"
