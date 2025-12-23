@@ -37,7 +37,10 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
           script: |
+            set -e  # Exit on any error
+            
             # Set the Host Virtual Memory (Required for ES)
             sudo sysctl -w vm.max_map_count=262144
             
@@ -50,51 +53,128 @@ jobs:
             docker stop es-node || true
             docker rm es-node || true
             
-            # Start container with strict Memory Limits for 1GB RAM VM
-            # Removed Kibana port 5601
+            # Clean up unused Docker resources to free memory
+            echo "Cleaning up Docker resources..."
+            docker system prune -af --volumes || true
+            
+            # Start container with OPTIMIZED settings for low memory
+            echo "Starting Elasticsearch container with optimized memory settings..."
             docker run -d --name es-node \
+              --memory="450m" \
+              --memory-swap="450m" \
               -p 9200:9200 \
               -e "discovery.type=single-node" \
-              -e "ES_JAVA_OPTS=-Xms256m -Xmx256m" \
+              -e "ES_JAVA_OPTS=-Xms192m -Xmx192m" \
+              -e "bootstrap.memory_lock=false" \
+              -e "cluster.routing.allocation.disk.threshold_enabled=false" \
+              -e "http.max_content_length=50mb" \
+              -e "indices.memory.index_buffer_size=10%" \
+              -e "indices.fielddata.cache.size=15%" \
+              -e "indices.queries.cache.size=10%" \
+              -e "thread_pool.write.queue_size=200" \
+              -e "thread_pool.search.queue_size=500" \
               -v es_data:/usr/share/elasticsearch/data \
               ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
             
-            # Wait for ES to be ready
-            echo "Waiting for ES startup..."
-            until curl -s localhost:9200 > /dev/null; do 
+            # Wait for ES to be ready (with timeout)
+            echo "Waiting for ES startup (max 5 minutes for low-memory startup)..."
+            COUNTER=0
+            MAX_TRIES=60
+            until curl -s localhost:9200 > /dev/null 2>&1; do
+              COUNTER=$((COUNTER+1))
+              if [ $COUNTER -gt $MAX_TRIES ]; then
+                echo "ERROR: Elasticsearch failed to start within 5 minutes"
+                echo "=== Docker logs ==="
+                docker logs --tail 100 es-node
+                echo "=== Memory usage ==="
+                free -h
+                echo "=== Docker stats ==="
+                docker stats --no-stream es-node
+                exit 1
+              fi
+              if [ $((COUNTER % 6)) -eq 0 ]; then
+                echo "Attempt $COUNTER/$MAX_TRIES - still waiting..."
+              fi
               sleep 5
             done
+            echo "✓ Elasticsearch is up!"
+            
+            # Show current memory usage
+            echo "=== Current Memory Usage ==="
+            free -h
+            docker stats --no-stream es-node
             
             # 3. Inject Credentials into Keystore
+            echo "Injecting GCS credentials..."
             docker cp /tmp/gcs-key.json es-node:/usr/share/elasticsearch/config/gcs-key.json
             docker exec es-node bin/elasticsearch-keystore add-file gcs.client.default.credentials_file config/gcs-key.json
             
             # Restart ES (Required in v6.8 for Keystore files to be recognized properly)
+            echo "Restarting Elasticsearch..."
             docker restart es-node
-            echo "Waiting for ES to restart after keystore update..."
-            until curl -s localhost:9200 > /dev/null; do 
+            
+            echo "Waiting for ES to restart (max 5 minutes)..."
+            COUNTER=0
+            until curl -s localhost:9200 > /dev/null 2>&1; do
+              COUNTER=$((COUNTER+1))
+              if [ $COUNTER -gt $MAX_TRIES ]; then
+                echo "ERROR: Elasticsearch failed to restart within 5 minutes"
+                echo "=== Docker logs ==="
+                docker logs --tail 100 es-node
+                exit 1
+              fi
+              if [ $((COUNTER % 6)) -eq 0 ]; then
+                echo "Attempt $COUNTER/$MAX_TRIES - still waiting..."
+              fi
               sleep 5
             done
+            echo "✓ Elasticsearch restarted successfully!"
             
             # 4. VERIFY: Check if GCS plugin is loaded via API
             echo "Verifying GCS Plugin status..."
+            curl -s "localhost:9200/_cat/plugins?v"
             if ! curl -s "localhost:9200/_cat/plugins?v" | grep -q repository-gcs; then
-              echo "Plugin not found!"
+              echo "ERROR: Plugin not found!"
               exit 1
             fi
+            echo "✓ GCS plugin verified!"
+            
+            # Check cluster health
+            echo "=== Cluster Health ==="
+            curl -s "localhost:9200/_cluster/health?pretty"
             
             # 5. START FLOW: Register GCS Repository
-            curl -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'{
+            echo "Registering GCS repository..."
+            RESPONSE=$(curl -s -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'{
               "type": "gcs",
               "settings": {
                 "bucket": "${{ secrets.GCS_BUCKET_NAME }}",
-                "base_path": "backups/v68"
+                "base_path": "backups/v68",
+                "compress": true,
+                "chunk_size": "10mb"
               }
-            }'
+            }')
+            echo "Repository registration response: $RESPONSE"
+            
+            # Verify repository
+            echo "=== Verifying Repository ==="
+            curl -s "localhost:9200/_snapshot/gcs_backup?pretty"
             
             # 6. TRIGGER SNAPSHOT
             echo "Starting Snapshot..."
-            curl -X PUT "localhost:9200/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false"
+            SNAPSHOT_RESPONSE=$(curl -s -X PUT "localhost:9200/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false")
+            echo "Snapshot response: $SNAPSHOT_RESPONSE"
+            
+            # Check snapshot status
+            sleep 3
+            echo "=== Snapshot Status ==="
+            curl -s "localhost:9200/_snapshot/gcs_backup/init_snapshot?pretty"
             
             # Cleanup temp file on host
             rm /tmp/gcs-key.json
+            
+            echo ""
+            echo "✓ Deployment complete!"
+            echo "=== Final Memory Usage ==="
+            free -h
+            docker stats --no-stream es-node
