@@ -53,24 +53,42 @@ jobs:
             ${{ secrets.GCS_SERVICE_ACCOUNT_JSON }}
             GCSKEYEOF
             
-            # Stop and Clean old containers
-            docker stop es-node || true
-            docker rm es-node || true
+            # Check what's currently running
+            echo "=== Current Containers ==="
+            docker ps -a
             
-            # Clean up unused Docker resources to free memory
-            echo "Cleaning up Docker resources..."
-            docker system prune -af --volumes || true
+            echo "=== Docker Volumes ==="
+            docker volume ls
+            
+            # Find the volume used by the existing ES container (if any)
+            EXISTING_VOLUME=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/usr/share/elasticsearch/data"}}{{.Name}}{{end}}{{end}}' $(docker ps -aq --filter "ancestor=docker.elastic.co/elasticsearch/elasticsearch:6.8.23") 2>/dev/null || echo "")
+            
+            if [ -n "$EXISTING_VOLUME" ]; then
+              echo "Found existing ES data volume: $EXISTING_VOLUME"
+              DATA_VOLUME="$EXISTING_VOLUME"
+            else
+              echo "No existing volume found, will use: es_data"
+              DATA_VOLUME="es_data"
+            fi
+            
+            # Stop old es-node if exists (but DON'T remove the volume)
+            docker stop es-node 2>/dev/null || true
+            docker rm es-node 2>/dev/null || true
+            
+            # Clean up unused Docker resources (but keep volumes!)
+            echo "Cleaning up Docker resources (keeping volumes)..."
+            docker system prune -af || true
             
             # Pull the latest image
             echo "Pulling latest image..."
             docker pull ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
             
-            # Start container with OPTIMIZED settings for low memory
-            echo "Starting Elasticsearch container with optimized memory settings..."
+            # Start NEW container on port 9201 with the SAME data volume
+            echo "Starting Elasticsearch container on port 9201 with volume: $DATA_VOLUME"
             docker run -d --name es-node \
               --memory="450m" \
               --memory-swap="450m" \
-              -p 9200:9200 \
+              -p 9201:9200 \
               -e "discovery.type=single-node" \
               -e "ES_JAVA_OPTS=-Xms192m -Xmx192m" \
               -e "bootstrap.memory_lock=false" \
@@ -81,14 +99,14 @@ jobs:
               -e "indices.queries.cache.size=10%" \
               -e "thread_pool.write.queue_size=200" \
               -e "thread_pool.search.queue_size=500" \
-              -v es_data:/usr/share/elasticsearch/data \
+              -v ${DATA_VOLUME}:/usr/share/elasticsearch/data \
               ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
             
             # Wait for ES to be ready (with timeout)
-            echo "Waiting for ES startup (max 5 minutes for low-memory startup)..."
+            echo "Waiting for ES startup (max 5 minutes)..."
             COUNTER=0
             MAX_TRIES=60
-            until curl -s localhost:9200 > /dev/null 2>&1; do
+            until curl -s localhost:9201 > /dev/null 2>&1; do
               COUNTER=$((COUNTER+1))
               if [ $COUNTER -gt $MAX_TRIES ]; then
                 echo "ERROR: Elasticsearch failed to start within 5 minutes"
@@ -105,7 +123,15 @@ jobs:
               fi
               sleep 5
             done
-            echo "✓ Elasticsearch is up!"
+            echo "✓ Elasticsearch is up on port 9201!"
+            
+            # Show ES cluster info (to verify it's using the old data)
+            echo "=== Elasticsearch Info ==="
+            curl -s "localhost:9201" | jq '.'
+            
+            # Show indices (to confirm data is accessible)
+            echo "=== Current Indices ==="
+            curl -s "localhost:9201/_cat/indices?v"
             
             # Show current memory usage
             echo "=== Current Memory Usage ==="
@@ -123,7 +149,7 @@ jobs:
             
             echo "Waiting for ES to restart (max 5 minutes)..."
             COUNTER=0
-            until curl -s localhost:9200 > /dev/null 2>&1; do
+            until curl -s localhost:9201 > /dev/null 2>&1; do
               COUNTER=$((COUNTER+1))
               if [ $COUNTER -gt $MAX_TRIES ]; then
                 echo "ERROR: Elasticsearch failed to restart within 5 minutes"
@@ -140,8 +166,8 @@ jobs:
             
             # 4. VERIFY: Check if GCS plugin is loaded via API
             echo "Verifying GCS Plugin status..."
-            curl -s "localhost:9200/_cat/plugins?v"
-            if ! curl -s "localhost:9200/_cat/plugins?v" | grep -q repository-gcs; then
+            curl -s "localhost:9201/_cat/plugins?v"
+            if ! curl -s "localhost:9201/_cat/plugins?v" | grep -q repository-gcs; then
               echo "ERROR: Plugin not found!"
               exit 1
             fi
@@ -149,11 +175,11 @@ jobs:
             
             # Check cluster health
             echo "=== Cluster Health ==="
-            curl -s "localhost:9200/_cluster/health?pretty"
+            curl -s "localhost:9201/_cluster/health?pretty"
             
             # 5. START FLOW: Register GCS Repository
             echo "Registering GCS repository..."
-            RESPONSE=$(curl -s -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'{
+            RESPONSE=$(curl -s -X PUT "localhost:9201/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'{
               "type": "gcs",
               "settings": {
                 "bucket": "${{ secrets.GCS_BUCKET_NAME }}",
@@ -166,17 +192,21 @@ jobs:
             
             # Verify repository
             echo "=== Verifying Repository ==="
-            curl -s "localhost:9200/_snapshot/gcs_backup?pretty"
+            curl -s "localhost:9201/_snapshot/gcs_backup?pretty"
             
             # 6. TRIGGER SNAPSHOT
             echo "Starting Snapshot..."
-            SNAPSHOT_RESPONSE=$(curl -s -X PUT "localhost:9200/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false")
+            SNAPSHOT_RESPONSE=$(curl -s -X PUT "localhost:9201/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false")
             echo "Snapshot response: $SNAPSHOT_RESPONSE"
             
             # Check snapshot status
             sleep 3
             echo "=== Snapshot Status ==="
-            curl -s "localhost:9200/_snapshot/gcs_backup/init_snapshot?pretty"
+            curl -s "localhost:9201/_snapshot/gcs_backup/init_snapshot?pretty"
+            
+            # List all snapshots
+            echo "=== All Snapshots ==="
+            curl -s "localhost:9201/_snapshot/gcs_backup/_all?pretty"
             
             # Cleanup temp file on host
             rm /tmp/gcs-key.json
@@ -189,3 +219,9 @@ jobs:
             echo "=== Final Memory Usage ==="
             free -h
             docker stats --no-stream es-node
+            
+            echo ""
+            echo "=== IMPORTANT ==="
+            echo "Your OLD Elasticsearch is on port 9200"
+            echo "Your NEW Elasticsearch with GCS backup is on port 9201"
+            echo "Both share the SAME data volume: $DATA_VOLUME"
