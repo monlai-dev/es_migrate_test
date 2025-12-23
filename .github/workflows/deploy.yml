@@ -71,13 +71,15 @@ jobs:
               DATA_VOLUME="es_data"
             fi
             
-            # Stop old es-node if exists (but DON'T remove the volume)
-            docker stop es-node 2>/dev/null || true
-            docker rm es-node 2>/dev/null || true
-            
-            # Clean up unused Docker resources (but keep volumes!)
-            echo "Cleaning up Docker resources (keeping volumes)..."
-            docker system prune -af || true
+            # 1. Stop BOTH potential containers to free up every drop of RAM
+	    echo "Stopping all ES containers to free memory..."
+	    docker stop es68 2>/dev/null || true
+	    docker stop es-node 2>/dev/null || true
+    	    docker rm es-node 2>/dev/null || true
+
+	    # 2. Clean up memory immediately
+	    echo "Pruning system to reclaim RAM..."
+	    docker system prune -f
             
             # Pull the latest image
             echo "Pulling latest image..."
