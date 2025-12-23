@@ -1,0 +1,92 @@
+name: ES 6.8 GCS Plugin & Verify Flow (No Kibana)
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1. Build the modified image with GCS Plugin
+      - name: Build Docker Image
+        run: |
+          cat <<EOF > Dockerfile
+          FROM docker.elastic.co/elasticsearch/elasticsearch:6.8.23
+          RUN bin/elasticsearch-plugin install --batch repository-gcs
+          EOF
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest .
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push Image
+        run: docker push ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
+
+      # 2. SSH to VM to update and verify
+      - name: SSH Deploy & Verify
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Set the Host Virtual Memory (Required for ES)
+            sudo sysctl -w vm.max_map_count=262144
+
+            # Save GCS Key from secret to a temp file
+            echo '${{ secrets.GCS_SERVICE_ACCOUNT_JSON }}' > /tmp/gcs-key.json
+
+            # Stop and Clean old containers
+            docker stop es-node || true
+            docker rm es-node || true
+
+            # Start container with strict Memory Limits for 1GB RAM VM
+            # Removed Kibana port 5601
+            docker run -d --name es-node \
+              -p 9200:9200 \
+              -e "discovery.type=single-node" \
+              -e "ES_JAVA_OPTS=-Xms256m -Xmx256m" \
+              -v es_data:/usr/share/elasticsearch/data \
+              ${{ secrets.DOCKER_USERNAME }}/es68-gcs:latest
+
+            # Wait for ES to be ready
+            echo "Waiting for ES startup..."
+            until curl -s localhost:9200; do sleep 5; done
+
+            # 3. Inject Credentials into Keystore
+            docker cp /tmp/gcs-key.json es-node:/usr/share/elasticsearch/config/gcs-key.json
+            docker exec es-node bin/elasticsearch-keystore add-file gcs.client.default.credentials_file config/gcs-key.json
+            
+            # Restart ES (Required in v6.8 for Keystore files to be recognized properly)
+            docker restart es-node
+            echo "Waiting for ES to restart after keystore update..."
+            until curl -s localhost:9200; do sleep 5; done
+
+            # 4. VERIFY: Check if GCS plugin is loaded via API
+            echo "Verifying GCS Plugin status..."
+            curl -s "localhost:9200/_cat/plugins?v" | grep repository-gcs || (echo "Plugin not found!" && exit 1)
+
+            # 5. START FLOW: Register GCS Repository
+            # Replace 'your-gcs-bucket-name' with your actual bucket secret if available
+            curl -X PUT "localhost:9200/_snapshot/gcs_backup" -H 'Content-Type: application/json' -d'
+            {
+              "type": "gcs",
+              "settings": {
+                "bucket": "${{ secrets.GCS_BUCKET_NAME }}",
+                "base_path": "backups/v68"
+              }
+            }'
+
+            # 6. TRIGGER SNAPSHOT
+            echo "Starting Snapshot..."
+            curl -X PUT "localhost:9200/_snapshot/gcs_backup/init_snapshot?wait_for_completion=false"
+            
+            # Cleanup temp file on host
+            rm /tmp/gcs-key.json
